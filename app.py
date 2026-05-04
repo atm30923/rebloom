@@ -15,12 +15,11 @@ import random
 # 설치 명령어:
 # py -m pip install streamlit openai python-dotenv openai-whisper
 #
-# 방향:
-# - 한 사람 전용 기억 전화부스
-# - 기억을 남기면 자동으로 번호와 추억 이름이 생성됨
-# - 추억 이름을 사용자가 직접 입력할 수도 있음
-# - 전화번호부에는 번호 + 추억 이름만 표시
-# - 번호를 입력하면 해당 기억이 사진/음성/자막처럼 재생되는 느낌
+# 기능:
+# - 기억 전화하기: 번호 입력 → 기억 재생
+# - 기억 인터뷰: 부스 질문 → 마이크 답변 → 텍스트 변환 → 질문 이어가기 → 저장
+# - 자유 기록: 질문 없이 바로 글/음성으로 원하는 기억 저장
+# - 기억 전화번호부: 번호 + 추억 이름 표시
 
 try:
     from openai import OpenAI
@@ -108,11 +107,22 @@ st.markdown("""
         padding: 20px;
         border-radius: 14px;
     }
+    .question-box {
+        font-size: 28px;
+        line-height: 1.55;
+        font-weight: 800;
+        color: #fff6e8;
+        background-color: #242424;
+        border-radius: 24px;
+        padding: 28px;
+        border: 5px solid #3b3b3b;
+        margin-bottom: 18px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-title">☎️ RE:Bloom 기억 전화부스</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">번호를 누르면 나의 추억이 다시 연결됩니다.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">질문에 답해도 되고, 원하는 기억을 자유롭게 남겨도 됩니다.</div>', unsafe_allow_html=True)
 
 # -------------------------
 # 기본 함수
@@ -161,6 +171,8 @@ def save_uploaded_file(uploaded_file, code, label):
     if uploaded_file is None:
         return ""
     ext = os.path.splitext(uploaded_file.name)[1]
+    if ext == "":
+        ext = ".wav"
     filename = f"{code}_{label}{ext}"
     path = os.path.join(MEDIA_DIR, filename)
     with open(path, "wb") as f:
@@ -184,14 +196,19 @@ def load_whisper_model():
     return whisper.load_model("base")
 
 
-def transcribe_audio(uploaded_audio):
+def transcribe_audio(audio_file):
     model = load_whisper_model()
     if model is None:
         return None, "Whisper가 설치되어 있지 않습니다. py -m pip install openai-whisper 를 실행해주세요."
 
-    suffix = os.path.splitext(uploaded_audio.name)[1]
+    suffix = ".wav"
+    if hasattr(audio_file, "name"):
+        ext = os.path.splitext(audio_file.name)[1]
+        if ext:
+            suffix = ext
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-        tmp_file.write(uploaded_audio.read())
+        tmp_file.write(audio_file.read())
         tmp_path = tmp_file.name
 
     try:
@@ -206,13 +223,14 @@ def transcribe_audio(uploaded_audio):
             pass
 
 # -------------------------
-# AI 정리
+# AI 정리 / 질문 생성
 # -------------------------
 def fallback_classify(story):
+    first_line = story.strip().split("\n")[0] if story.strip() else "오늘의 기억"
     return {
-        "title": "오늘의 기억",
-        "summary": "사용자가 남긴 개인적인 기억을 정리한 기록입니다.",
-        "caption": story[:160] if story else "기억이 기록되었습니다.",
+        "title": first_line[:18] if first_line else "오늘의 기억",
+        "summary": "사용자의 기록을 바탕으로 정리된 개인 기억입니다.",
+        "caption": story[:180] if story else "기억이 기록되었습니다.",
         "question": "이 기억에서 가장 선명하게 남아 있는 장면은 무엇인가요?",
         "message": "이 기억은 시간이 지나도 다시 꺼내볼 수 있는 소중한 기록입니다."
     }
@@ -223,11 +241,11 @@ def ai_classify_memory(story):
         return fallback_classify(story)
 
     prompt = f"""
-다음 개인 기억을 정리해줘.
+다음 기록을 하나의 개인 기억으로 정리해줘.
 원본을 과장하거나 꾸미지 말고, 사용자가 말한 내용 기반으로만 정리해.
 아래 JSON 형식으로만 답해줘. 설명 문장 금지.
 
-[원본 기억]
+[기록]
 {story}
 
 필드:
@@ -251,6 +269,112 @@ def ai_classify_memory(story):
         return json.loads(text)
     except Exception:
         return fallback_classify(story)
+
+
+def generate_followup_question(questions, answers):
+    if client is None:
+        return "그 기억을 떠올리면 지금 가장 전하고 싶은 말은 무엇인가요?"
+
+    history = ""
+    for i, (q, a) in enumerate(zip(questions, answers), start=1):
+        history += f"Q{i}. {q}\nA{i}. {a}\n\n"
+
+    used_questions = "\n".join([f"- {q}" for q in questions])
+
+    prompt = f"""
+너는 노년층의 잊고 있던 기억을 떠올리게 만드는 전화부스 인터뷰어다.
+아래 대화 내용을 보고 다음 질문 하나만 만들어줘.
+
+[이미 사용한 질문]
+{used_questions}
+
+[이전 대화]
+{history}
+
+규칙:
+- 이전 질문과 비슷한 질문 금지.
+- 이미 나온 내용 반복 금지.
+- 반드시 새로운 관점에서 물어봐.
+- 사람, 장소, 냄새, 소리, 장면, 미처 하지 못한 말 중 하나를 자연스럽게 이어서 물어봐.
+- 질문은 한 문장만.
+- 따뜻하고 부담스럽지 않게.
+- 답변은 질문 문장만 출력해.
+"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "너는 따뜻하고 신중한 기억 인터뷰어다."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.75
+        )
+        return response.choices[0].message.content.strip().replace('"', '')
+    except Exception:
+        return "그 기억을 떠올리면 지금 가장 전하고 싶은 말은 무엇인가요?"
+
+# -------------------------
+# 인터뷰 상태 초기화
+# -------------------------
+FIXED_QUESTIONS = [
+    "떠올리고 싶은 기억은 어떤 장면인가요?",
+    "그때 어디에 있었고, 누구와 함께 있었나요?",
+    "그 장면에서 가장 선명하게 기억나는 소리, 냄새, 말은 무엇인가요?"
+]
+TOTAL_QUESTIONS = 5
+
+
+def start_interview():
+    st.session_state["interview_started"] = True
+    st.session_state["interview_done"] = False
+    st.session_state["interview_step"] = 0
+    st.session_state["interview_questions"] = [FIXED_QUESTIONS[0]]
+    st.session_state["interview_answers"] = []
+    st.session_state["current_transcript"] = ""
+
+
+def reset_interview():
+    for key in [
+        "interview_started",
+        "interview_done",
+        "interview_step",
+        "interview_questions",
+        "interview_answers",
+        "current_transcript",
+        "free_transcript"
+    ]:
+        if key in st.session_state:
+            del st.session_state[key]
+
+# -------------------------
+# 기억 저장 공통 함수
+# -------------------------
+def create_and_save_memory(story, title_input, visibility, input_type, image_upload=None, video_upload=None, audio_upload=None):
+    classified = ai_classify_memory(story)
+    code = make_memory_code()
+
+    title = title_input.strip() if title_input and title_input.strip() else classified.get("title", "오늘의 기억")
+    image_filename = save_uploaded_file(image_upload, code, "image")
+    video_filename = save_uploaded_file(video_upload, code, "video")
+    audio_filename = save_uploaded_file(audio_upload, code, "audio")
+
+    memory = {
+        "code": code,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "visibility": visibility,
+        "input_type": input_type,
+        "story": story,
+        "title": title,
+        "summary": classified.get("summary", "요약 없음"),
+        "caption": classified.get("caption", story[:180]),
+        "question": classified.get("question", ""),
+        "message": classified.get("message", ""),
+        "audio": audio_filename,
+        "image": image_filename,
+        "video": video_filename
+    }
+    save_memory(memory)
+    return memory
 
 # -------------------------
 # 기억 재생 화면
@@ -289,7 +413,7 @@ def render_memory_player(memory):
     st.markdown('<div class="memory-card">', unsafe_allow_html=True)
     st.markdown("#### 기억 요약")
     st.write(memory.get("summary"))
-    st.markdown("#### 원본 기록")
+    st.markdown("#### 기록")
     st.write(memory.get("story"))
     st.markdown("#### 가족에게 남기는 메시지")
     st.write(memory.get("message"))
@@ -327,18 +451,22 @@ with st.sidebar:
         for memory in memories[:12]:
             st.write(f"{memory.get('code')}  {memory.get('title')}")
     st.divider()
-    st.write("기억을 저장하면 번호와 추억 이름이 자동으로 등록됩니다.")
+    st.write("기록이 끝나면 번호와 추억 이름이 자동으로 등록됩니다.")
 
 # -------------------------
 # 탭 구성
 # -------------------------
-tab_call, tab_book, tab_record, tab_explain = st.tabs([
+tab_call, tab_interview, tab_free, tab_book, tab_explain = st.tabs([
     "📞 기억 전화하기",
+    "🎙️ 기억 인터뷰",
+    "✍️ 자유 기록",
     "📒 기억 전화번호부",
-    "🎙️ 기억 남기기",
     "🧭 프로젝트 설명"
 ])
 
+# -------------------------
+# 1. 기억 전화하기
+# -------------------------
 with tab_call:
     st.markdown('<div class="phone-box">', unsafe_allow_html=True)
     st.subheader("번호를 입력하세요")
@@ -368,6 +496,202 @@ with tab_call:
         else:
             st.info("아직 저장된 기억이 없습니다. 먼저 기억을 남겨주세요.")
 
+# -------------------------
+# 2. 기억 인터뷰
+# -------------------------
+with tab_interview:
+    st.markdown('<div class="phone-box">', unsafe_allow_html=True)
+    st.subheader("기억 인터뷰를 시작합니다")
+    st.write("부스가 질문을 하면, 마이크 버튼을 눌러 대답해주세요. 답변은 자동으로 기록되고 마지막에 하나의 추억으로 저장됩니다.")
+
+    col_start, col_reset = st.columns(2)
+    with col_start:
+        if st.button("☎️ 인터뷰 시작하기", use_container_width=True):
+            start_interview()
+    with col_reset:
+        if st.button("처음부터 다시하기", use_container_width=True):
+            reset_interview()
+            st.rerun()
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if not st.session_state.get("interview_started", False):
+        st.info("인터뷰 시작하기 버튼을 눌러주세요.")
+
+    elif st.session_state.get("interview_done", False):
+        st.success("인터뷰가 끝났습니다. 아래에서 추억 이름을 확인하고 저장해주세요.")
+
+        questions = st.session_state.get("interview_questions", [])
+        answers = st.session_state.get("interview_answers", [])
+
+        interview_text = ""
+        for i, (q, a) in enumerate(zip(questions, answers), start=1):
+            interview_text += f"Q{i}. {q}\nA{i}. {a}\n\n"
+
+        st.markdown("#### 인터뷰 전체 기록")
+        st.text_area("전체 기록", value=interview_text, height=260)
+
+        with st.spinner("추억 이름과 요약을 준비하고 있습니다..."):
+            classified = ai_classify_memory(interview_text)
+
+        custom_title = st.text_input(
+            "추억 이름",
+            value=classified.get("title", "오늘의 기억"),
+            placeholder="예: 엄마가 해주던 된장찌개, 첫 월급 받던 날"
+        )
+
+        visibility = st.selectbox("보관 방식", ["본인만 보관", "가족에게 공유", "사후 공개", "전시용 익명 공개"], key="interview_visibility")
+        image_upload = st.file_uploader("사진 추가 선택", type=["jpg", "jpeg", "png"], key="interview_image")
+        video_upload = st.file_uploader("영상 추가 선택", type=["mp4", "mov"], key="interview_video")
+
+        if st.button("📞 통화 종료 및 기억 저장하기", use_container_width=True):
+            memory = create_and_save_memory(
+                story=interview_text,
+                title_input=custom_title,
+                visibility=visibility,
+                input_type="마이크 인터뷰",
+                image_upload=image_upload,
+                video_upload=video_upload,
+                audio_upload=None
+            )
+            st.success(f"기억이 저장되었습니다. 기억 번호는 {memory['code']} 입니다.")
+            render_memory_player(memory)
+
+    else:
+        step = st.session_state.get("interview_step", 0)
+        questions = st.session_state.get("interview_questions", [])
+        answers = st.session_state.get("interview_answers", [])
+        current_question = questions[step]
+
+        st.markdown(f'<div class="question-box">☎️ 질문 {step + 1}/{TOTAL_QUESTIONS}<br><br>{current_question}</div>', unsafe_allow_html=True)
+
+        st.write("마이크 버튼을 누르고 답변한 뒤, 아래 변환 버튼을 눌러주세요. 직접 글로 수정해도 됩니다.")
+        recorded_audio = st.audio_input("🎤 답변 녹음하기", key=f"audio_step_{step}")
+
+        if recorded_audio:
+            st.audio(recorded_audio)
+            if st.button("음성을 글로 변환하기", key=f"transcribe_{step}", use_container_width=True):
+                with st.spinner("음성을 텍스트로 변환 중입니다..."):
+                    transcript, error = transcribe_audio(recorded_audio)
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state["current_transcript"] = transcript
+                    st.success("변환 완료")
+
+        answer_text = st.text_area(
+            "답변 확인 및 수정",
+            value=st.session_state.get("current_transcript", ""),
+            height=160,
+            key=f"answer_text_{step}"
+        )
+
+        if st.button("다음 질문으로", key=f"next_{step}", use_container_width=True):
+            if not answer_text.strip():
+                st.error("답변을 녹음하거나 입력해주세요.")
+            else:
+                st.session_state["interview_answers"].append(answer_text.strip())
+                st.session_state["current_transcript"] = ""
+
+                next_step = step + 1
+                if next_step >= TOTAL_QUESTIONS:
+                    st.session_state["interview_done"] = True
+                else:
+                    if next_step < len(FIXED_QUESTIONS):
+                        next_question = FIXED_QUESTIONS[next_step]
+                    else:
+                        next_question = generate_followup_question(
+                            st.session_state["interview_questions"],
+                            st.session_state["interview_answers"]
+                        )
+                    st.session_state["interview_questions"].append(next_question)
+                    st.session_state["interview_step"] = next_step
+                st.rerun()
+
+        if answers:
+            st.markdown("#### 지금까지의 답변")
+            for i, (q, a) in enumerate(zip(questions, answers), start=1):
+                with st.expander(f"Q{i}. {q}"):
+                    st.write(a)
+
+# -------------------------
+# 3. 자유 기록
+# -------------------------
+with tab_free:
+    st.markdown('<div class="phone-box">', unsafe_allow_html=True)
+    st.subheader("자유롭게 기억을 남겨주세요")
+    st.write("질문에 답하지 않아도 됩니다. 원하는 기억을 바로 말하거나 적어서 저장할 수 있습니다.")
+
+    free_title = st.text_input(
+        "추억 이름",
+        placeholder="예: 엄마가 해주던 된장찌개, 첫 월급 받던 날, 아버지와 걷던 밤",
+        key="free_title"
+    )
+    st.caption("비워두면 입력한 내용을 바탕으로 추억 이름을 자동 생성합니다.")
+
+    free_visibility = st.selectbox("보관 방식", ["본인만 보관", "가족에게 공유", "사후 공개", "전시용 익명 공개"], key="free_visibility")
+
+    record_method = st.radio("기록 방식", ["글로 기록하기", "말로 기록하기"], horizontal=True)
+
+    free_story = ""
+    free_audio_to_save = None
+
+    if record_method == "글로 기록하기":
+        free_story = st.text_area(
+            "기억을 자유롭게 적어주세요.",
+            height=260,
+            placeholder="예: 오늘 문득 어릴 적 집 앞 골목이 생각났습니다...",
+            key="free_text"
+        )
+    else:
+        st.write("마이크 버튼을 누르고 말한 뒤, 변환 버튼을 눌러주세요.")
+        recorded_free_audio = st.audio_input("🎤 자유 기록 녹음하기", key="free_audio")
+        if recorded_free_audio:
+            free_audio_to_save = recorded_free_audio
+            st.audio(recorded_free_audio)
+            if st.button("음성을 글로 변환하기", key="free_transcribe", use_container_width=True):
+                with st.spinner("음성을 텍스트로 변환 중입니다..."):
+                    transcript, error = transcribe_audio(recorded_free_audio)
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state["free_transcript"] = transcript
+                    st.success("변환 완료")
+
+        free_story = st.text_area(
+            "내용 확인 및 수정",
+            value=st.session_state.get("free_transcript", ""),
+            height=260,
+            key="free_story_from_audio"
+        )
+
+    st.markdown("#### 사진/영상 추가")
+    st.write("선택 사항입니다. 등록하면 번호 연결 시 함께 표시됩니다.")
+    free_image_upload = st.file_uploader("사진 업로드", type=["jpg", "jpeg", "png"], key="free_image")
+    free_video_upload = st.file_uploader("영상 업로드", type=["mp4", "mov"], key="free_video")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if st.button("📞 자유 기록 저장하기", use_container_width=True):
+        if not free_story.strip():
+            st.error("기억 내용을 입력하거나 녹음 후 변환해주세요.")
+        else:
+            with st.spinner("기억을 정리하고 전화번호부에 등록하고 있습니다..."):
+                memory = create_and_save_memory(
+                    story=free_story,
+                    title_input=free_title,
+                    visibility=free_visibility,
+                    input_type=record_method,
+                    image_upload=free_image_upload,
+                    video_upload=free_video_upload,
+                    audio_upload=free_audio_to_save
+                )
+            st.success(f"기억이 저장되었습니다. 기억 번호는 {memory['code']} 입니다.")
+            render_memory_player(memory)
+
+# -------------------------
+# 4. 기억 전화번호부
+# -------------------------
 with tab_book:
     st.subheader("📒 기억 전화번호부")
     st.write("전화번호부에는 번호와 추억 이름만 표시됩니다.")
@@ -394,132 +718,52 @@ with tab_book:
             if selected:
                 render_memory_player(selected)
 
-with tab_record:
-    st.markdown('<div class="phone-box">', unsafe_allow_html=True)
-    st.subheader("기억을 남겨주세요")
-    st.write("말하거나 적은 기억은 자동으로 번호가 붙어 전화번호부에 저장됩니다.")
-
-    custom_title = st.text_input(
-        "추억 이름",
-        placeholder="예: 엄마가 해주던 된장찌개, 첫 월급 받던 날, 아버지와 걷던 밤"
-    )
-    st.caption("비워두면 입력한 기억 내용을 바탕으로 추억 이름을 자동 생성합니다.")
-
-    visibility = st.selectbox("보관 방식", ["본인만 보관", "가족에게 공유", "사후 공개", "전시용 익명 공개"])
-    consent = st.checkbox("이 기억을 저장하고 정리하는 것에 동의합니다.")
-
-    input_type = st.radio("입력 방식", ["텍스트 입력", "음성 파일 업로드"], horizontal=True)
-    story = ""
-
-    uploaded_audio_for_record = None
-    if input_type == "텍스트 입력":
-        story = st.text_area(
-            "기억을 자유롭게 적어주세요.",
-            height=230,
-            placeholder="예: 어릴 때 우리 집 마당에는 감나무가 있었고, 어머니가 가을마다 감을 따서 말려주셨습니다..."
-        )
-    else:
-        st.info("프로토타입은 1~3분 음성 파일을 권장합니다. 실제 서비스에서는 긴 음성을 나누어 저장하도록 확장할 수 있습니다.")
-        uploaded_audio_for_record = st.file_uploader("음성 파일 업로드 mp3/wav/m4a", type=["mp3", "wav", "m4a"], key="record_audio")
-        if uploaded_audio_for_record:
-            st.audio(uploaded_audio_for_record)
-            if st.button("🎤 음성을 글로 변환하기", use_container_width=True):
-                with st.spinner("음성을 텍스트로 변환 중입니다..."):
-                    transcript, error = transcribe_audio(uploaded_audio_for_record)
-                if error:
-                    st.error(error)
-                else:
-                    st.session_state["transcript"] = transcript
-                    st.success("음성 변환 완료")
-        story = st.text_area(
-            "변환된 텍스트를 확인하고 수정할 수 있습니다.",
-            value=st.session_state.get("transcript", ""),
-            height=230
-        )
-
-    st.markdown("#### 사진/영상 추가")
-    st.write("선택 사항입니다. 등록하면 번호 연결 시 함께 표시됩니다.")
-    image_upload = st.file_uploader("사진 업로드", type=["jpg", "jpeg", "png"], key="image_upload")
-    video_upload = st.file_uploader("영상 업로드", type=["mp4", "mov"], key="video_upload")
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    if st.button("📞 통화 종료 및 기억 저장하기", use_container_width=True):
-        if not consent:
-            st.error("저장 동의가 필요합니다.")
-        elif not story.strip():
-            st.error("기억 내용을 입력하거나 음성 변환을 완료해주세요.")
-        else:
-            with st.spinner("기억을 정리하고 전화번호부에 등록하고 있습니다..."):
-                classified = ai_classify_memory(story)
-                code = make_memory_code()
-
-                title = custom_title.strip() if custom_title.strip() else classified.get("title", "오늘의 기억")
-
-                audio_filename = ""
-                if uploaded_audio_for_record is not None:
-                    audio_filename = save_uploaded_file(uploaded_audio_for_record, code, "audio")
-
-                image_filename = save_uploaded_file(image_upload, code, "image")
-                video_filename = save_uploaded_file(video_upload, code, "video")
-
-                memory = {
-                    "code": code,
-                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "visibility": visibility,
-                    "input_type": input_type,
-                    "story": story,
-                    "title": title,
-                    "summary": classified.get("summary", "요약 없음"),
-                    "caption": classified.get("caption", story[:160]),
-                    "question": classified.get("question", ""),
-                    "message": classified.get("message", ""),
-                    "audio": audio_filename,
-                    "image": image_filename,
-                    "video": video_filename
-                }
-                save_memory(memory)
-
-            st.success(f"기억이 저장되었습니다. 기억 번호는 {code} 입니다.")
-            render_memory_player(memory)
-
+# -------------------------
+# 5. 프로젝트 설명
+# -------------------------
 with tab_explain:
     st.subheader("🧭 프로젝트 설명")
     st.markdown("""
 ### 서비스 방향
 RE:Bloom은 한 사람의 추억을 계속 기록하는 개인 기억 전화부스입니다.  
-사용자가 텍스트 또는 음성으로 기억을 남기면, 시스템이 추억 이름과 기억 번호를 부여하고 전화번호부에 저장합니다.
+사용자는 부스가 던지는 질문에 답하며 기억을 떠올릴 수도 있고, 질문 없이 원하는 기억을 자유롭게 남길 수도 있습니다.
 
 ### 사용 흐름
-1. 사용자가 추억 이름을 적습니다. 비워두면 자동으로 생성됩니다.  
-2. 사용자가 기억을 말하거나 적습니다.  
-3. 기록이 저장되면 기억 번호가 생성됩니다.  
-4. 기억 전화번호부에는 번호와 추억 이름만 표시됩니다.  
-5. 이후 번호를 입력하면 해당 기억이 다시 재생됩니다.  
-6. 사진, 영상, 음성 파일이 있으면 함께 표시됩니다.
+1. **기억 인터뷰**  
+   부스가 질문을 던지고, 사용자는 마이크로 답변합니다. 답변이 쌓이면 하나의 기억으로 저장됩니다.
+
+2. **자유 기록**  
+   사용자가 원하는 기억을 직접 글로 쓰거나 말로 녹음해 저장합니다.
+
+3. **기억 전화번호부**  
+   저장된 기억은 번호와 추억 이름으로 정리됩니다.
+
+4. **기억 전화하기**  
+   번호를 입력하면 해당 기억이 다시 재생됩니다.
 
 ### 데이터 수집 방법
 실제 운영에서는 다음 방식으로 기록을 모을 수 있습니다.
 
 1. **부스 내 직접 녹음**  
-사용자가 기기 앞에서 직접 자신의 기억을 말합니다.
+   사용자가 부스에서 질문에 답하거나 자유롭게 말하며 직접 기억을 남깁니다.
 
 2. **인터뷰 기반 수집**  
-복지관, 요양원, 마을회관 등에서 인터뷰어가 질문을 던지고 기록합니다.
+   복지관, 요양원, 마을회관 등에서 인터뷰어가 질문을 던지고 기록합니다.
 
 3. **가족 자료 업로드**  
-가족이 사진, 음성, 영상, 편지 등을 제공하면 기억 기록에 연결합니다.
+   가족이 사진, 영상, 편지 등을 제공하면 기억 기록에 연결합니다.
 
 4. **이동형 기록 키트**  
-부스 방문이 어려운 어르신을 위해 직접 방문해 기록합니다.
+   부스 방문이 어려운 어르신을 위해 직접 방문해 기록합니다.
 
 5. **기억 카드 작성**  
-말로 표현하기 어려운 사용자를 위해 종이 카드에 짧게 적고 이를 디지털화합니다.
+   말로 표현하기 어려운 사용자를 위해 종이 카드에 짧게 적고 이를 디지털화합니다.
 
 ### 기록 처리 흐름
+- 마이크 답변 녹음 또는 텍스트 입력
 - 음성 파일을 텍스트로 변환
 - 원본 기록 저장
-- 추억 이름 저장 또는 자동 생성
+- 추억 이름 자동 생성 또는 직접 입력
 - 기억 번호 자동 부여
 - 전화번호부에 저장
 - 번호 입력 시 기억 재생
