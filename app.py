@@ -13,7 +13,10 @@ import random
 # py -m streamlit run app.py
 #
 # 설치 명령어:
-# py -m pip install streamlit openai python-dotenv openai-whisper
+# py -m pip install streamlit openai python-dotenv
+#
+# 웹 배포 시 Streamlit Secrets에 아래처럼 입력:
+# OPENAI_API_KEY = "키"
 #
 # 기능:
 # - 기억 전화하기: 번호 입력 → 기억 재생
@@ -26,14 +29,10 @@ try:
     from dotenv import load_dotenv
 
     load_dotenv()
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
+    client = OpenAI(api_key=api_key) if api_key else None
 except Exception:
     client = None
-
-try:
-    import whisper
-except Exception:
-    whisper = None
 
 MEMORY_DIR = "personal_memories"
 MEDIA_DIR = "personal_media"
@@ -175,6 +174,7 @@ def save_uploaded_file(uploaded_file, code, label):
         ext = ".wav"
     filename = f"{code}_{label}{ext}"
     path = os.path.join(MEDIA_DIR, filename)
+    uploaded_file.seek(0)
     with open(path, "wb") as f:
         f.write(uploaded_file.read())
     return filename
@@ -187,40 +187,41 @@ def media_path(filename):
     return path if os.path.exists(path) else None
 
 # -------------------------
-# Whisper 음성 변환
+# OpenAI 음성 변환
 # -------------------------
-@st.cache_resource
-def load_whisper_model():
-    if whisper is None:
-        return None
-    return whisper.load_model("base")
-
-
 def transcribe_audio(audio_file):
-    model = load_whisper_model()
-    if model is None:
-        return None, "Whisper가 설치되어 있지 않습니다. py -m pip install openai-whisper 를 실행해주세요."
-
-    suffix = ".wav"
-    if hasattr(audio_file, "name"):
-        ext = os.path.splitext(audio_file.name)[1]
-        if ext:
-            suffix = ext
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-        tmp_file.write(audio_file.read())
-        tmp_path = tmp_file.name
+    if client is None:
+        return None, "OpenAI API 키가 설정되어 있지 않습니다. Streamlit Secrets에 OPENAI_API_KEY를 넣어주세요."
 
     try:
-        result = model.transcribe(tmp_path, language="ko")
-        return result["text"].strip(), None
-    except Exception as e:
-        return None, str(e)
-    finally:
+        audio_file.seek(0)
+
+        suffix = ".wav"
+        if hasattr(audio_file, "name"):
+            ext = os.path.splitext(audio_file.name)[1]
+            if ext:
+                suffix = ext
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+            tmp_file.write(audio_file.read())
+            tmp_path = tmp_file.name
+
+        with open(tmp_path, "rb") as f:
+            response = client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=f,
+                language="ko"
+            )
+
         try:
             os.remove(tmp_path)
         except Exception:
             pass
+
+        return response.text.strip(), None
+
+    except Exception as e:
+        return None, str(e)
 
 # -------------------------
 # AI 정리 / 질문 생성
